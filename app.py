@@ -20,7 +20,7 @@ load_dotenv()
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()  # free key from pexels.com/api
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()  # free key from pixabay.com/api/docs
 RETRIES = 4  # attempts per model when Google says "busy"
 SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -72,33 +72,34 @@ def to_int(v):
 
 @lru_cache(maxsize=256)
 def fetch_photo(query):
-    """Find one free stock photo for a search phrase using the Pexels API.
+    """Find one free stock photo for a search phrase using the Pixabay API.
     Returns a dict, or None if there is no key, no result, or any problem."""
-    if not PEXELS_API_KEY:
+    if not PIXABAY_API_KEY:
         return None
     try:
-        url = "https://api.pexels.com/v1/search?per_page=1&orientation=portrait&query=" + quote_plus(query)
-        req = urllib.request.Request(url, headers={
-            "Authorization": PEXELS_API_KEY, "User-Agent": "StyleMate/1.0"})
+        url = ("https://pixabay.com/api/?image_type=photo&orientation=vertical&safesearch=true"
+               "&per_page=3&key=" + quote_plus(PIXABAY_API_KEY) + "&q=" + quote_plus(query[:100]))
+        req = urllib.request.Request(url, headers={"User-Agent": "StyleMate/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        photos = data.get("photos") or []
-        if not photos:
+        hits = data.get("hits") or []
+        if not hits:
             return None
-        p = photos[0]
-        img = (p.get("src") or {}).get("medium", "")
-        page = p.get("url", "")
-        # Only accept real Pexels addresses before sending them to the browser.
-        if not img.startswith("https://images.pexels.com/") or not page.startswith("https://www.pexels.com/"):
+        p = hits[0]
+        img = p.get("webformatURL", "")
+        page = p.get("pageURL", "")
+        # Only accept real Pixabay addresses before sending them to the browser.
+        ok_img = img.startswith(("https://pixabay.com/", "https://cdn.pixabay.com/"))
+        if not ok_img or not page.startswith("https://pixabay.com/"):
             return None
         return {
             "image": img,
             "page": page,
-            "photographer": str(p.get("photographer", ""))[:60],
-            "alt": str(p.get("alt") or query)[:120],
+            "photographer": str(p.get("user", ""))[:60],
+            "alt": str(p.get("tags") or query)[:120],
         }
     except Exception as e:  # photos are a bonus: never break the whole answer
-        app.logger.warning("Pexels lookup failed for %r: %s", query, e)
+        app.logger.warning("Pixabay lookup failed for %r: %s", query, type(e).__name__)
         return None
 
 
@@ -125,7 +126,7 @@ def clean_items(raw):
             "_query": query,
         })
     # Look up all photos at the same time so the page stays fast.
-    if items and PEXELS_API_KEY:
+    if items and PIXABAY_API_KEY:
         with ThreadPoolExecutor(max_workers=6) as pool:
             photos = list(pool.map(lambda i: fetch_photo(i["_query"]), items))
         for item, photo in zip(items, photos):
@@ -217,7 +218,7 @@ function renderItems(items){
       const c=document.createElement('div'); c.className='credit';
       c.appendChild(document.createTextNode('Similar style. Photo by '+(it.photo.photographer||'a photographer')+' on '));
       const pa=document.createElement('a'); pa.href=it.photo.page; pa.target='_blank'; pa.rel='noopener noreferrer';
-      pa.textContent='Pexels'; c.appendChild(pa); body.appendChild(c);
+      pa.textContent='Pixabay'; c.appendChild(pa); body.appendChild(c);
     }
     card.appendChild(body); out.appendChild(card);
   });
@@ -291,4 +292,4 @@ def suggest():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1", port=int(os.getenv("PORT", "5001")))

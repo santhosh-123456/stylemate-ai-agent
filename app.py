@@ -1,7 +1,12 @@
-"""StyleMate: AI dress code agent (Flask + Gemini). Run with: python app.py"""
+"""StyleMate: AI dress code agent (Flask + Gemini) with shopping links.
+Run with: python app.py
+"""
+import json
 import os
+import re
 import time
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -13,18 +18,91 @@ load_dotenv()
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
 RETRIES = 4  # attempts per model when Google says "busy"
+SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+# Added to the system prompt so the model also returns a shopping list the app can turn into links.
+JSON_RULES = """
+
+OUTPUT FORMAT OVERRIDE (this replaces any other output format above):
+Reply with ONLY one JSON object, no code fences, shaped exactly like this:
+{"advice": "<your full answer as Markdown, in the format described above>",
+ "items": [{"for": "Boy or Girl or Person", "name": "<short product name>",
+            "search_query": "<what to type in a shopping site search box, e.g. men emerald green silk blend kurta>",
+            "price_min_inr": 1200, "price_max_inr": 2500}]}
+List 3 to 6 individual wearable items from your outfit (one entry per item, per person if the
+request is for both). Prices are your rough estimates in Indian rupees (numbers only).
+Never invent store names, brands or web links."""
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB upload limit
 
 
 def is_busy_error(e):
     """True for temporary Google-side problems (503 overloaded, 500, 429 rate limit)."""
     code = getattr(e, "code", None)
     return code in (429, 500, 502, 503, 504) or "UNAVAILABLE" in str(e)
-SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
-IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB upload limit
+
+def build_links(query):
+    """Search links for each shop. No scraping and no paid keys: just URLs."""
+    q = quote_plus(query)
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
+    return [
+        {"site": "Amazon", "url": f"https://www.amazon.in/s?k={q}"},
+        {"site": "Flipkart", "url": f"https://www.flipkart.com/search?q={q}"},
+        {"site": "Myntra", "url": f"https://www.myntra.com/{slug}"},
+        {"site": "Ajio", "url": f"https://www.ajio.com/search/?text={q}"},
+        {"site": "Meesho", "url": f"https://www.meesho.com/search?q={q}"},
+        {"site": "Compare on Google Shopping", "url": f"https://www.google.com/search?tbm=shop&q={q}"},
+    ]
+
+
+def to_int(v):
+    try:
+        return int(float(str(v).replace(",", "").strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def clean_items(raw):
+    items = []
+    for it in (raw or [])[:6]:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", "")).strip()[:80]
+        query = str(it.get("search_query") or name).strip()[:120]
+        if not name or not query:
+            continue
+        lo, hi = to_int(it.get("price_min_inr")), to_int(it.get("price_max_inr"))
+        price_text = ""
+        if lo and hi:
+            price_text = f"approx. Rs {lo:,} - Rs {hi:,}"
+        elif lo or hi:
+            price_text = f"approx. Rs {(lo or hi):,}"
+        items.append({
+            "for": str(it.get("for", "")).strip()[:20],
+            "name": name,
+            "price_text": price_text,
+            "links": build_links(query),
+        })
+    return items
+
+
+def parse_reply(text):
+    """Return (advice_markdown, items). Falls back to plain text if the JSON is broken."""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1]):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and data.get("advice"):
+                return str(data["advice"]), clean_items(data.get("items"))
+        except (ValueError, TypeError):
+            continue
+    return text or "No answer came back. Please try again.", []
+
 
 HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -39,8 +117,13 @@ HTML = """<!doctype html>
   button:disabled{opacity:.6}
   #out{margin-top:24px;padding:16px;background:#f6f5ff;border-radius:10px;display:none}
   .err{color:#b00020}
+  .note{color:#666;font-size:.9em;margin:4px 0 12px}
+  .card{background:#fff;border:1px solid #e3e0ff;border-radius:10px;padding:12px;margin:10px 0}
+  .links{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px}
+  .links a{padding:6px 12px;border-radius:999px;background:#ece9ff;color:#3b22c9;text-decoration:none;font-size:.9em}
+  .links a:hover{background:#d9d3ff}
 </style></head><body>
-<h1>StyleMate</h1><p class="sub">Get an outfit suggestion, with or without a photo.</p>
+<h1>StyleMate</h1><p class="sub">Get an outfit suggestion, with or without a photo, plus shopping links.</p>
 <form id="f">
   <label>Who is it for?</label>
   <select name="who"><option>Boy</option><option>Girl</option><option>Both</option><option selected>Not specified</option></select>
@@ -56,6 +139,27 @@ HTML = """<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 const f=document.getElementById('f'),out=document.getElementById('out'),b=document.getElementById('b');
+
+function renderItems(items){
+  if(!items||!items.length) return;
+  const h=document.createElement('h3'); h.textContent='Shop these items'; out.appendChild(h);
+  const note=document.createElement('p'); note.className='note';
+  note.textContent='Prices are rough estimates. Tap a store to see live prices, or use Google Shopping to compare many stores at once.';
+  out.appendChild(note);
+  items.forEach(it=>{
+    const card=document.createElement('div'); card.className='card';
+    const t=document.createElement('strong');
+    t.textContent=(it.for?'['+it.for+'] ':'')+it.name+(it.price_text?' - '+it.price_text:'');
+    card.appendChild(t);
+    const row=document.createElement('div'); row.className='links';
+    it.links.forEach(l=>{
+      const a=document.createElement('a'); a.href=l.url; a.target='_blank'; a.rel='noopener noreferrer';
+      a.textContent=l.site; row.appendChild(a);
+    });
+    card.appendChild(row); out.appendChild(card);
+  });
+}
+
 f.addEventListener('submit',async e=>{
   e.preventDefault(); b.disabled=true; b.textContent='Thinking...';
   out.style.display='block'; out.textContent='Working on your outfit...';
@@ -63,7 +167,10 @@ f.addEventListener('submit',async e=>{
     const r=await fetch('/suggest',{method:'POST',body:new FormData(f)});
     const d=await r.json();
     if(d.error){out.innerHTML='<span class="err"></span>';out.firstChild.textContent=d.error;}
-    else{out.innerHTML=(window.marked?marked.parse(d.result):d.result.replace(/\\n/g,'<br>'));}
+    else{
+      out.innerHTML=(window.marked?marked.parse(d.result):d.result.replace(/\\n/g,'<br>'));
+      renderItems(d.items);
+    }
   }catch(err){out.innerHTML='<span class="err">Could not reach the server.</span>';}
   b.disabled=false; b.textContent='Suggest outfit';
 });
@@ -96,17 +203,20 @@ def suggest():
         parts.append(types.Part.from_bytes(data=photo.read(), mime_type=photo.mimetype))
         parts.append("A photo of the person is attached.")  # kept in memory only, never saved
 
-    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.7)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT + JSON_RULES,
+        temperature=0.7,
+        response_mime_type="application/json",
+    )
     # Try the main model, then the optional backup model from .env (GEMINI_FALLBACK_MODEL).
     models = [MODEL] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != MODEL else [])
-    last_error = None
     for model in models:
         for attempt in range(RETRIES):
             try:
                 resp = client.models.generate_content(model=model, contents=parts, config=config)
-                return jsonify(result=resp.text or "No answer came back. Please try again.")
+                advice, items = parse_reply(resp.text)
+                return jsonify(result=advice, items=items)
             except Exception as e:
-                last_error = e
                 app.logger.warning("Gemini %s attempt %d failed: %s", model, attempt + 1, e)
                 if not is_busy_error(e):
                     return jsonify(error=f"AI error: {e}"), 502  # real problem: retrying won't help

@@ -5,6 +5,9 @@ import json
 import os
 import re
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -17,6 +20,7 @@ load_dotenv()
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()  # free key from pexels.com/api
 RETRIES = 4  # attempts per model when Google says "busy"
 SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -66,6 +70,38 @@ def to_int(v):
         return None
 
 
+@lru_cache(maxsize=256)
+def fetch_photo(query):
+    """Find one free stock photo for a search phrase using the Pexels API.
+    Returns a dict, or None if there is no key, no result, or any problem."""
+    if not PEXELS_API_KEY:
+        return None
+    try:
+        url = "https://api.pexels.com/v1/search?per_page=1&orientation=portrait&query=" + quote_plus(query)
+        req = urllib.request.Request(url, headers={
+            "Authorization": PEXELS_API_KEY, "User-Agent": "StyleMate/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        photos = data.get("photos") or []
+        if not photos:
+            return None
+        p = photos[0]
+        img = (p.get("src") or {}).get("medium", "")
+        page = p.get("url", "")
+        # Only accept real Pexels addresses before sending them to the browser.
+        if not img.startswith("https://images.pexels.com/") or not page.startswith("https://www.pexels.com/"):
+            return None
+        return {
+            "image": img,
+            "page": page,
+            "photographer": str(p.get("photographer", ""))[:60],
+            "alt": str(p.get("alt") or query)[:120],
+        }
+    except Exception as e:  # photos are a bonus: never break the whole answer
+        app.logger.warning("Pexels lookup failed for %r: %s", query, e)
+        return None
+
+
 def clean_items(raw):
     items = []
     for it in (raw or [])[:6]:
@@ -86,7 +122,16 @@ def clean_items(raw):
             "name": name,
             "price_text": price_text,
             "links": build_links(query),
+            "_query": query,
         })
+    # Look up all photos at the same time so the page stays fast.
+    if items and PEXELS_API_KEY:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            photos = list(pool.map(lambda i: fetch_photo(i["_query"]), items))
+        for item, photo in zip(items, photos):
+            item["photo"] = photo
+    for item in items:
+        item.pop("_query", None)
     return items
 
 
@@ -122,6 +167,10 @@ HTML = """<!doctype html>
   .links{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px}
   .links a{padding:6px 12px;border-radius:999px;background:#ece9ff;color:#3b22c9;text-decoration:none;font-size:.9em}
   .links a:hover{background:#d9d3ff}
+  .item{display:flex;gap:14px;align-items:flex-start}
+  .item img{width:110px;height:140px;object-fit:cover;border-radius:8px;flex:none;background:#eee}
+  .credit{font-size:.75em;color:#777;margin-top:4px}
+  .credit a{color:#777}
 </style></head><body>
 <h1>StyleMate</h1><p class="sub">Get an outfit suggestion, with or without a photo, plus shopping links.</p>
 <form id="f">
@@ -146,17 +195,31 @@ function renderItems(items){
   const note=document.createElement('p'); note.className='note';
   note.textContent='Prices are rough estimates. Tap a store to see live prices, or use Google Shopping to compare many stores at once.';
   out.appendChild(note);
+  let anyPhoto=false;
   items.forEach(it=>{
-    const card=document.createElement('div'); card.className='card';
+    const card=document.createElement('div'); card.className='card item';
+    if(it.photo){
+      anyPhoto=true;
+      const img=document.createElement('img'); img.src=it.photo.image; img.alt=it.photo.alt; img.loading='lazy';
+      card.appendChild(img);
+    }
+    const body=document.createElement('div');
     const t=document.createElement('strong');
     t.textContent=(it.for?'['+it.for+'] ':'')+it.name+(it.price_text?' - '+it.price_text:'');
-    card.appendChild(t);
+    body.appendChild(t);
     const row=document.createElement('div'); row.className='links';
     it.links.forEach(l=>{
       const a=document.createElement('a'); a.href=l.url; a.target='_blank'; a.rel='noopener noreferrer';
       a.textContent=l.site; row.appendChild(a);
     });
-    card.appendChild(row); out.appendChild(card);
+    body.appendChild(row);
+    if(it.photo){
+      const c=document.createElement('div'); c.className='credit';
+      c.appendChild(document.createTextNode('Similar style. Photo by '+(it.photo.photographer||'a photographer')+' on '));
+      const pa=document.createElement('a'); pa.href=it.photo.page; pa.target='_blank'; pa.rel='noopener noreferrer';
+      pa.textContent='Pexels'; c.appendChild(pa); body.appendChild(c);
+    }
+    card.appendChild(body); out.appendChild(card);
   });
 }
 
